@@ -1,0 +1,686 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+knitr::opts_knit$set(root.dir = normalizePath("/home1/wangaman/490_cluster/outputs"))
+```
+
+
+```{r}
+#loading all the required files
+if (!require("knitr", quietly = TRUE)) {
+  install.packages("knitr")
+}
+if (!require("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+if (!require("TCGAbiolinks", quietly = TRUE)) {
+  BiocManager::install("TCGAbiolinks", ask = FALSE, update = FALSE)
+}
+if (!require("maftools", quietly = TRUE)) {
+  BiocManager::install("maftools", ask = FALSE, update = FALSE)
+}
+if (!require("SummarizedExperiment", quietly = TRUE)) {
+  BiocManager::install("SummarizedExperiment", ask = FALSE, update = FALSE)
+}
+if (!require("DESeq2", quietly = TRUE)) {
+  BiocManager::install("DESeq2", ask = FALSE, update = FALSE)
+}
+cran_pkgs <- c("dplyr", "tidyr", "stringr", "ggplot2", "survival", "survminer")
+for (p in cran_pkgs) {
+  if (!require(p, character.only = TRUE, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+}
+library(knitr)
+library(BiocManager)
+library(TCGAbiolinks)
+library(maftools)
+library(SummarizedExperiment)
+library(DESeq2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(survival)
+library(survminer)
+```
+```{r}
+clin_query <- GDCquery(
+  project      = "TCGA-HNSC",
+  data.category = "Clinical",
+  data.type     = "Clinical Supplement",
+  data.format   = "BCR Biotab"
+)
+
+GDCdownload(clin_query)
+clinical.BCRtab.all <- GDCprepare(clin_query)
+clinic <- clinical.BCRtab.all$clinical_patient_hnsc[-c(1, 2), ]
+```
+```{r}
+maf_query <- GDCquery(
+  project      = "TCGA-HNSC",
+  data.category = "Simple Nucleotide Variation",
+  access        = "open",
+  data.type     = "Masked Somatic Mutation",
+  workflow.type = "Aliquot Ensemble Somatic Variant Merging and Masking"
+)
+
+GDCdownload(maf_query, method = "api", files.per.chunk = 100)
+maf <- GDCprepare(maf_query)
+
+# rename patient barcode in clinic to match MAF expectations
+colnames(clinic)[colnames(clinic) == "bcr_patient_barcode"] <- "Tumor_Sample_Barcode"
+
+# build maftools object
+maf_object <- read.maf(
+  maf          = maf,
+  clinicalData = clinic,
+  isTCGA       = TRUE
+)
+```
+```{r}
+rna_query <- GDCquery(
+  project      = "TCGA-HNSC",
+  data.category = "Transcriptome Profiling",
+  data.type     = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+GDCdownload(rna_query)
+rna_se <- GDCprepare(rna_query)
+```
+```{r}
+#clean the data for tumor stage column
+# Clinical data: clean and keep key variables for TCGA-HNSC
+
+
+library(dplyr)
+clinic_raw <- clinical.BCRtab.all$clinical_patient_hnsc
+
+# Drop the first two metadata rows (non-patient data)
+clinic_raw <- clinic_raw[-c(1, 2), ]
+
+barcode_cols <- grep("barcode", colnames(clinic_raw),
+                     ignore.case = TRUE, value = TRUE)
+barcode_cols
+
+
+if (length(barcode_cols) == 0) {
+  stop("No barcode-like column found in clinic_raw; check colnames(clinic_raw).")
+}
+
+# Create a clean clinical dataframe with:
+#   - a unified patient_barcode
+#   - age at diagnosis (numeric)
+#   - simplified AJCC tumor stage (I–IVC)
+#   - gender and tumor_status
+clinic_raw <- clinic_raw %>%
+  mutate(
+    patient_barcode = .data[[ barcode_cols[1] ]],
+    age_years = as.numeric(age_at_initial_pathologic_diagnosis),
+    stage = as.character(ajcc_pathologic_tumor_stage),
+    stage = ifelse(stage %in% c("[Not Available]", "", NA), NA, stage),
+    stage = gsub("Stage ", "", stage),
+    stage = toupper(stage),
+    stage = ifelse(stage %in% c("I","II","III","IV","IVA","IVB","IVC"), stage, NA)
+  ) %>%
+  filter(
+    !is.na(patient_barcode),
+    !is.na(gender),
+    !is.na(stage)
+  ) %>%
+  mutate(
+    stage = factor(stage,
+                   levels = c("I","II","III","IV","IVA","IVB","IVC"),
+                   ordered = TRUE)
+  ) %>%
+# keep only the columns we need downstream
+  dplyr::select(
+    patient_barcode,
+    bcr_patient_uuid,
+    gender,
+    age_years,
+    tumor_status,
+    stage
+  )
+
+# This is the cleaned clinical dataset we will use later
+head(clinic_raw)
+clin_clean <- clinic_raw
+
+# RNA metadata: one row per RNA-seq sample
+rna_meta <- as.data.frame(colData(rna_se))
+
+# Extract full sample barcode and the corresponding patient barcode
+rna_ids <- rna_meta %>%
+  dplyr::select(
+    sample_id = barcode,   # full sample barcode
+    patient_barcode = patient  # short TCGA-XX-XXXX
+  )
+
+head(rna_ids)
+
+# Check how many patients have both clinical data and RNA-seq data
+length(intersect(clin_clean$patient_barcode, rna_ids$patient_barcode))
+
+```
+```{r}
+#figure 1 cleaned
+# Extract TRAF3 expression from RNA-seq counts (for Figure 1)
+
+
+rna_counts <- assay(rna_se)                  # genes x samples
+gene_info  <- as.data.frame(rowData(rna_se)) # gene-level metadata
+
+# Identify the row(s) corresponding to the gene TRAF3.
+# A few datasets list multiple rows for the same gene (different transcripts),
+# so we search across all metadata fields.
+traf3_rows <- which(apply(gene_info, 1, function(x) any(x == "TRAF3")))
+length(traf3_rows)
+traf3_rows
+
+# Extract TRAF3 raw counts from the first matching row.
+traf3_counts <- rna_counts[traf3_rows[1], ]
+
+# Build a dataframe with:
+#   - patient_barcode (TCGA-XX-XXXX form)
+#   - raw TRAF3 counts
+#   - log2-transformed TRAF3 counts for visualization
+traf3_expr_df <- data.frame(
+  patient_barcode = substr(colnames(rna_counts), 1, 12),  # TCGA-XX-XXXX
+  traf3_counts    = as.numeric(traf3_counts),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::mutate(
+    traf3_log2 = log2(traf3_counts + 1)  # simple log2 transform
+  )
+
+# Quick checks
+head(traf3_expr_df)
+summary(traf3_expr_df$traf3_log2)
+
+# Merge TRAF3 expression with cleaned clinical data
+# This gives one row per patient with both clinical and expression information.
+fig1_df <- clin_clean %>%
+  dplyr::inner_join(
+    traf3_expr_df %>% dplyr::select(patient_barcode, traf3_log2),
+    by = "patient_barcode"
+  )
+
+# How many samples do we have for the plot?
+nrow(fig1_df)
+head(fig1_df)
+```
+
+```{r}
+# figure 1 plotted
+# This plot visualizes how TRAF3 RNA expression varies by AJCC tumor stage, and whether the pattern differs between male and female patients.
+
+library(ggplot2)
+
+ggplot(fig1_df, aes(x = stage, y = traf3_log2, fill = stage)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.8) +
+  facet_wrap(~ gender) +
+  labs(
+    title = "TRAF3 Expression Across Tumor Stages in TCGA-HNSC",
+    x = "Tumor Stage",
+    y = "TRAF3 Expression (log2 counts + 1)"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+```
+```{r}
+# Figure 2 setup: define TRAF3 High vs Low groups for DESeq2
+# Goal: split samples into TRAF3-High and TRAF3-Low groups based on RNA-seq expression, so we can run differential expression between these two subtypes.
+
+rna_counts <- assay(rna_se)
+sample_ids <- colnames(rna_counts)
+
+# Map full sample IDs (TCGA-XX-XXXX-XX...) to patient-level barcodes (TCGA-XX-XXXX)
+patient_barcodes <- substr(sample_ids, 1, 12)
+
+# Extract TRAF3 raw counts for all samples (using the same row index as in Figure 1)
+traf3_counts <- rna_counts[traf3_rows[1], ]
+
+# Build a sample-level metadata table with TRAF3 expression
+sample_info <- data.frame(
+  sample_id       = sample_ids,
+  patient_barcode = patient_barcodes,
+  traf3_counts    = as.numeric(traf3_counts),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::mutate(
+    traf3_log2 = log2(traf3_counts + 1)
+  )
+
+head(sample_info)
+summary(sample_info$traf3_log2)
+
+# Use the 25th and 75th percentiles of TRAF3 expression to define extremes:
+#   - Low group  = bottom quartile
+#   - High group = top quartile
+q1 <- quantile(sample_info$traf3_log2, 0.25, na.rm = TRUE)
+q3 <- quantile(sample_info$traf3_log2, 0.75, na.rm = TRUE)
+
+q1; q3  # just to inspect
+
+
+# Keep only samples in the High or Low TRAF3 groups and set "High" as the reference level for DESeq2.
+sample_info <- sample_info %>%
+  dplyr::mutate(
+    traf3_group = dplyr::case_when(
+      traf3_log2 <= q1 ~ "Low",
+      traf3_log2 >= q3 ~ "High",
+      TRUE             ~ NA_character_
+    )
+  )
+
+sample_info_de <- sample_info %>%
+  dplyr::filter(!is.na(traf3_group)) %>%
+  dplyr::mutate(
+    traf3_group = factor(traf3_group, levels = c("High", "Low")) # High as reference
+  )
+
+table(sample_info_de$traf3_group)
+head(sample_info_de)
+
+
+selected_samples <- sample_info_de$sample_id
+counts_de <- rna_counts[, selected_samples]
+
+#ensure columns of counts_de match rows of sample_info_de
+all(colnames(counts_de) == sample_info_de$sample_id)
+
+```
+```{r}
+#figure 2 continued
+# Differential expression: TRAF3-Low vs TRAF3-High (for Figure 2)
+# Goal: identify genes whose expression differs between TRAF3-Low and TRAF3-High tumors using DESeq2, with log2 fold changes shrunk using apeglm.
+
+if (!require(apeglm)) BiocManager::install("apeglm")
+library(apeglm)
+library(DESeq2)
+
+# Build a DESeq2 dataset using:
+#   - counts_de: RNA-seq count matrix for selected samples
+#   - sample_info_de: metadata with traf3_group (High vs Low)
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_de,
+  colData   = sample_info_de,
+  design    = ~ traf3_group
+)
+dds <- DESeq(dds)
+
+# Extract results comparing TRAF3-Low vs TRAF3-High
+# (Low relative to High, so positive log2FC = higher in Low group)
+res <- results(dds, contrast = c("traf3_group", "Low", "High"))
+
+# Apply shrinkage to log2 fold changes using apeglm to stabilize estimates
+res <- lfcShrink(
+  dds,
+  coef = "traf3_group_Low_vs_High",
+  type = "apeglm"
+)
+res_df <- as.data.frame(res)
+res_df$gene <- rownames(res_df)
+
+head(res_df)
+summary(res_df)
+```
+```{r}
+#figure 2 plotting
+# Figure 2: Volcano plot of differential expression (TRAF3-Low vs TRAF3-High), visualizes genes that are significantly up- or down-regulated between TRAF3-Low and TRAF3-High tumors. Significant genes are colored based on direction of change, and TRAF3 itself is highlighted for reference.
+
+library(ggplot2)
+
+res_df_clean <- res_df[!is.na(res_df$padj), ]
+fc_cutoff  <- 1        # |log2FC| > 1
+padj_cutoff <- 0.05
+
+# Classify each gene as upregulated, downregulated, or not significant
+res_df_clean$sig <- "Not significant"
+res_df_clean$sig[res_df_clean$padj < padj_cutoff & 
+                 res_df_clean$log2FoldChange > fc_cutoff]  <- "Up in TRAF3-Low"
+res_df_clean$sig[res_df_clean$padj < padj_cutoff & 
+                 res_df_clean$log2FoldChange < -fc_cutoff] <- "Down in TRAF3-Low"
+
+res_df_clean$sig <- factor(
+  res_df_clean$sig,
+  levels = c("Not significant", "Up in TRAF3-Low", "Down in TRAF3-Low")
+)
+
+# Extract TRAF3 point so we can highlight it on the plot
+traf3_point <- subset(res_df_clean, gene == "TRAF3")
+
+# Build volcano plot
+ggplot(res_df_clean, aes(x = log2FoldChange, y = -log10(padj), color = sig)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  scale_color_manual(values = c("grey70", "red", "blue")) +
+  geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), linetype = "dashed") +
+  geom_hline(yintercept = -log10(padj_cutoff), linetype = "dashed") +
+  # highlight TRAF3
+  geom_point(data = traf3_point, color = "black", size = 3) +
+  geom_text(
+    data = traf3_point,
+    aes(label = "TRAF3"),
+    vjust = -1,
+    color = "black",
+    fontface = "bold",
+    size = 4
+  ) +
+  labs(
+    title = "Volcano Plot: TRAF3-Low vs TRAF3-High Tumors (TCGA-HNSC)",
+    x = "log2 Fold Change (Low vs High TRAF3)",
+    y = "-log10 adjusted p-value",
+    color = "Gene class"
+  ) +
+  theme_bw(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.margin = margin(15, 15, 15, 15)
+  )
+```
+```{r}
+#figure 3
+# Survival data: define overall survival and join with TRAF3 groups (for Figure 3)
+# Goal: build a survival dataframe with overall survival time (days), event status (dead/alive), and TRAF3 High/Low groups for KM analysis.
+
+if (!require(survival))  install.packages("survival")
+if (!require(survminer)) install.packages("survminer")
+
+library(dplyr)
+library(survival)
+library(survminer)
+
+clinic_raw <- clinical.BCRtab.all$clinical_patient_hnsc
+clinic_raw <- clinic_raw[-c(1, 2), ]   # drop header rows
+grep("barcode", colnames(clinic_raw), ignore.case = TRUE, value = TRUE)
+
+barcode_col <- grep("barcode", colnames(clinic_raw),
+                    ignore.case = TRUE, value = TRUE)[1]
+
+# Create a unified patient_barcode column for merging with other datasets
+clinic_raw <- clinic_raw %>%
+  mutate(
+    patient_barcode = .data[[barcode_col]]
+  )
+
+
+# Construct survival variables:
+#   - os_time  = time (in days) from diagnosis to death or last contact
+#   - os_event = 1 if patient is dead, 0 if alive at last follow-up
+clinic_surv <- clinic_raw %>%
+  mutate(
+    # convert days columns to numeric
+    death_days_to        = suppressWarnings(as.numeric(death_days_to)),
+    last_contact_days_to = suppressWarnings(as.numeric(last_contact_days_to)),
+
+    # overall survival time (days)
+    os_time = ifelse(!is.na(death_days_to),
+                     death_days_to,
+                     last_contact_days_to),
+
+    # event: 1 = dead, 0 = alive
+    os_event = case_when(
+      vital_status == "Dead"  ~ 1,
+      vital_status == "Alive" ~ 0,
+      TRUE                    ~ NA_real_
+    ),
+
+    age_years = suppressWarnings(
+      as.numeric(age_at_initial_pathologic_diagnosis)
+    )
+  ) %>%
+  
+  # keep only patients with valid barcode and survival information
+  filter(
+    !is.na(patient_barcode),
+    !is.na(os_time),
+    os_time > 0,
+    !is.na(os_event)
+  ) %>%
+  select(
+    patient_barcode,
+    os_time,
+    os_event,
+    gender,
+    age_years
+  )
+
+head(clinic_surv)
+summary(clinic_surv$os_time)
+table(clinic_surv$os_event)
+
+# Merge survival data with TRAF3 High/Low grouping (from sample_info_de)
+# This gives one row per patient with both survival outcome and TRAF3 group.
+surv_df <- clinic_surv %>%
+  inner_join(
+    sample_info_de %>% select(patient_barcode, traf3_group),
+    by = "patient_barcode"
+  ) %>%
+  filter(!is.na(traf3_group))
+
+head(surv_df)
+table(surv_df$traf3_group)
+summary(surv_df$os_time)
+
+```
+```{r}
+# figure 3 plotted
+# Figure 3: Kaplan–Meier survival by TRAF3 expression group 
+# Goal: compare overall survival between TRAF3-High and TRAF3-Low tumors using a Kaplan–Meier curve and log-rank test.
+
+# Fit Kaplan–Meier survival curves for each TRAF3 group
+fit_traf3 <- survfit(
+  Surv(os_time, os_event) ~ traf3_group,
+  data = surv_df
+)
+
+# Test for a difference in survival between groups using the log-rank test
+surv_diff <- survdiff(
+  Surv(os_time, os_event) ~ traf3_group,
+  data = surv_df
+)
+
+# Compute the log-rank p-value from the chi-square statistic
+pval <- 1 - pchisq(surv_diff$chisq, df = length(surv_diff$n) - 1)
+pval
+cols <- c("High" = "#009E73", "Low" = "#D55E00")
+
+plot(
+  fit_traf3,
+  col  = cols[levels(surv_df$traf3_group)],
+  lwd  = 2,
+  xlab = "Time (days)",
+  ylab = "Overall survival probability",
+  main = "Overall Survival by TRAF3 Expression Group in TCGA-HNSC"
+)
+
+legend(
+  "bottomleft",
+  legend = c("High TRAF3", "Low TRAF3"),
+  col    = cols[c("High", "Low")],
+  lwd    = 2,
+  bty    = "n"
+)
+
+# Add log-rank p-value on the plot
+text(
+  x      = max(surv_df$os_time, na.rm = TRUE) * 0.6,
+  y      = 0.2,
+  labels = paste0("log-rank p = ", signif(pval, 3))
+)
+```
+```{r}
+library(maftools)
+
+# Goal: explore the TCGA-HNSC mutation dataset and verify that genes like TRAF3, PIK3CA, and E2F1 are present before generating lollipop and oncoplots.
+maf_object
+
+# Here we inspect the top mutated genes to understand mutation landscape.
+getGeneSummary(maf_object)[1:20, ]
+
+```
+```{r}
+#figure 4: Oncoplot of key genes mutated in TCGA-HNSC
+# Goal: visualize mutation patterns of TRAF3, PIK3CA, and E2F1 across patients in the TCGA-HNSC cohort. This helps compare mutation frequency and whether these genes tend to co-occur or appear independently.
+
+library(maftools)
+
+# Define genes of interest based on literature and TCGA-HNSC findings
+genes_of_interest <- c("TRAF3", "PIK3CA", "E2F1")
+gene_summary <- getGeneSummary(maf_object)
+
+# Check whether these genes are present in the MAF (mutation) dataset
+genes_present <- genes_of_interest[genes_of_interest %in% gene_summary$Hugo_Symbol]
+genes_present
+
+oncoplot(
+  maf   = maf_object,
+  genes = genes_present
+)
+```
+```{r}
+
+# ---- Figure 5: Somatic Interaction Plot (Top 20 Mutated Genes) ----
+# Goal: identify patterns of co-occurrence or mutual exclusivity among the most frequently mutated genes in TCGA-HNSC. This helps determine whether TRAF3-related pathways interact with other major oncogenic drivers such as PIK3CA, TP53, FAT1, or NOTCH1.
+
+library(maftools)
+
+somaticInteractions(
+  maf = maf_object,
+  top = 20,          # top 20 mutated genes (PIK3CA will definitely be in here)
+  pvalue = c(0.05, 0.1) # highlight interactions with p-values <0.05 or <0.1
+)
+```
+```{r pik3ca_lollipop, fig.width=20, fig.height=6}
+# ---- Figure 6: Lollipop Plot for PIK3CA Mutations ----
+# Goal: visualize the specific protein-domain locations of mutations in PIK3CA, one of the key genes altered in TCGA-HNSC. This highlights whether mutations cluster in known functional hotspots (e.g., kinase domain), which may help explain differences in tumor biology relative to TRAF3 status.
+
+lollipopPlot(maf = maf_object, gene = "PIK3CA")
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# ---- HPV status vs TRAF3 expression: data preparation ----
+# Goal: build a dataset linking HPV status (ISH-based) with TRAF3 expression.
+# This allows comparison of TRAF3 RNA levels between HPV-positive and HPV-negative tumors, which is biologically relevant because HPV-driven HNSC is known to have distinct molecular profiles.
+
+
+hpv_expr_df <- clinic_raw %>%
+  mutate(
+    hpv_status_ish = as.character(hpv_status_ish)
+  ) %>%
+  # keep only usable HPV categories
+  filter(
+    !is.na(hpv_status_ish),
+    hpv_status_ish != "[Not Available]",
+    hpv_status_ish != ""
+  ) %>%
+  select(patient_barcode, hpv_status_ish) %>%
+  inner_join(
+    traf3_expr_df %>% select(patient_barcode, traf3_log2),
+    by = "patient_barcode"
+  ) %>%
+  mutate(
+    hpv_status_ish = factor(hpv_status_ish)
+  )
+
+table(hpv_expr_df$hpv_status_ish)
+summary(hpv_expr_df$traf3_log2)
+nrow(hpv_expr_df)
+```
+```{r}
+# ---- Additional Figure: TRAF3 expression in HPV-positive vs HPV-negative tumors ----
+# Goal: compare TRAF3 RNA expression between HPV-positive and HPV-negative HNSC tumors. HPV-driven tumors are known to be molecularly distinct, so this plot helps evaluate whether TRAF3 expression differs by HPV infection status.
+
+# Keep only clear HPV-positive or HPV-negative samples
+hpv_expr_clean <- hpv_expr_df %>%
+  filter(hpv_status_ish %in% c("Positive", "Negative")) %>%
+  droplevels()
+
+# Boxplot + jitter to show distribution of TRAF3 expression by HPV status
+ggplot(hpv_expr_clean, aes(x = hpv_status_ish, y = traf3_log2, fill = hpv_status_ish)) +
+  geom_boxplot(outlier.alpha = 0.4) +
+  geom_jitter(width = 0.12, alpha = 0.5, size = 0.8) +
+  labs(
+    title = "TRAF3 Expression in HPV-Positive vs HPV-Negative Tumors",
+    x = "HPV Status (ISH)",
+    y = "TRAF3 Expression (log2 counts + 1)"
+  ) +
+  scale_fill_manual(values = c("Negative" = "#1B9E77", "Positive" = "#D95F02")) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14)
+  )
+```
+```{r}
+
+# Additional Figure: TRAF3 expression by smoking history
+# Goal: compare TRAF3 RNA expression between patients who have ever smoked (current or former smokers) and those who have never smoked. Smoking is a major risk factor for HPV-negative HNSC, so this analysis tests whether TRAF3 levels differ by smoking exposure.
+
+# Link clinical smoking status to the cleaned clinical dataset
+clin_smoke <- clin_clean %>%
+  left_join(
+    clinic %>%
+      select(bcr_patient_uuid, tobacco_smoking_history_indicator),
+    by = "bcr_patient_uuid"
+  )
+
+# Recode indicator categories into biologically meaningful groups:
+#   "1" → Never smoker
+#   "2", "3", "4" → Ever smoker (current/former)
+#   others → Unknown (not used in plot)
+clin_smoke <- clin_smoke %>%
+  mutate(
+    smoking_group = case_when(
+      tobacco_smoking_history_indicator == "1" ~ "Never smoker",
+      tobacco_smoking_history_indicator %in% c("2", "3", "4") ~ "Ever smoker",
+      TRUE ~ "Unknown"
+    )
+  )
+
+# Add TRAF3 expression to smoking dataset
+smoke_df <- clin_smoke %>%
+  inner_join(
+    traf3_expr_df %>% select(patient_barcode, traf3_log2),
+    by = "patient_barcode"
+  )
+
+# Keep only the clearly defined smoking categories
+smoke_plot_df <- smoke_df %>%
+  filter(smoking_group %in% c("Never smoker", "Ever smoker")) %>%
+  droplevels()
+
+# Boxplot + jitter visualization of TRAF3 expression by smoking history
+ggplot(smoke_plot_df, aes(x = smoking_group, y = traf3_log2, fill = smoking_group)) +
+  geom_boxplot(alpha = 0.8) +
+  geom_jitter(width = 0.12, alpha = 0.5, size = 0.8) +
+  scale_fill_manual(values = c("Never smoker" = "#009E73", "Ever smoker" = "#D55E00")) +
+  labs(
+    title = "TRAF3 Expression in Never vs Ever Smokers (TCGA-HNSC)",
+    x = "Smoking History",
+    y = "TRAF3 Expression (log2 counts + 1)"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14)
+  )
+```
+
+
+
+
+
+
